@@ -11,11 +11,19 @@ Item {
     // "both" | "icon" | "text"
     property string display: "both"
 
+    // Submenu header state: expanded drives the chevron; indent nests children.
+    readonly property bool isSubmenu: item ? item.type === "submenu" : false
+    property bool expanded: false
+    property real indent: 0
+    signal toggleExpand()
+
     readonly property string _refId: item ? (item.widgetId || item.pluginId || "") : ""
+    readonly property real _chevronSpace: isSubmenu ? (Theme.iconSize - 4) + Theme.spacingM : 0
 
     readonly property string resolvedIcon: {
         if (!item) return "extension"
         if (item.icon && item.icon !== "") return item.icon
+        if (item.type === "submenu") return "folder"
         if ((item.type === "plugin" || item.type === "popout") && _refId && pluginService)
             return pluginService.availablePlugins[_refId]?.icon || "extension"
         return "extension"
@@ -41,7 +49,7 @@ Item {
 
     StyledRect {
         anchors.fill: parent
-        anchors.leftMargin: Theme.spacingS
+        anchors.leftMargin: Theme.spacingS + root.indent
         anchors.rightMargin: Theme.spacingS
         radius: Theme.cornerRadius
         color: hoverArea.containsMouse ? Theme.surfaceContainerHighest : "transparent"
@@ -71,10 +79,21 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 elide: Text.ElideRight
                 visible: root.showLabel
-                width: root.showIcon
+                width: (root.showIcon
                     ? parent.width - Theme.iconSize - Theme.spacingM * 2
-                    : parent.width
+                    : parent.width) - root._chevronSpace
             }
+        }
+
+        // Submenu expand/collapse affordance
+        DankIcon {
+            visible: root.isSubmenu
+            name: root.expanded ? "expand_less" : "expand_more"
+            size: Theme.iconSize - 4
+            color: Theme.surfaceText
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
         }
 
         MouseArea {
@@ -84,6 +103,10 @@ Item {
             cursorShape: Qt.PointingHandCursor
             onClicked: {
                 if (!root.item) return
+                if (root.isSubmenu) {
+                    root.toggleExpand()
+                    return
+                }
                 if (root.item.type === "action")
                     root.executeAction(root.item.command || "")
                 else if (root.item.type === "plugin")

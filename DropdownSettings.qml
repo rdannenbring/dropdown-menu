@@ -14,6 +14,13 @@ PluginSettings {
     property string editingVariantId: ""
     property var editingVariant: null
 
+    // Drill-in navigation for sub-menus. -1 = editing the variant's root items;
+    // >=0 = editing that root submenu's children. One level for now: deeper
+    // nesting would make this a path (array of indices) instead of a single int.
+    property int editingSubmenuIndex: -1
+    property string editingSubmenuLabel: ""
+    readonly property bool _atRoot: editingSubmenuIndex < 0
+
     onVariantsChanged: {
         localVariantsModel.clear()
         for (let i = 0; i < variants.length; i++) {
@@ -28,6 +35,13 @@ PluginSettings {
         if (editingVariantId !== "") {
             const found = variants.find(v => v.id === editingVariantId) || null
             editingVariant = found
+            // If an external change removed/retyped the submenu we're inside, pop
+            // back to root so we don't edit a phantom level.
+            if (editingSubmenuIndex >= 0) {
+                const rootItems = found?.items ?? []
+                const sm = rootItems[editingSubmenuIndex]
+                if (!sm || sm.type !== "submenu") _drillOut()
+            }
             _syncItemsModel()
         }
     }
@@ -171,9 +185,13 @@ PluginSettings {
             pluginCommandPicker.currentValue = pluginActionOptions.length > 0 ? pluginActionOptions[0].label : ""
         if (!pluginId)
             return
-        // Need the live IPC function lists to map detected targets -> functions
-        if (!ipcLoaded && !ipcLoading)
-            _loadIpcTargets()
+        // NOTE: IPC discovery (`dms ipc --help`) is deliberately NOT auto-run here.
+        // It enumerates every registered IpcHandler and can crash the shell via an
+        // upstream quickshell `wireDef` segfault on an un-wireable handler. So the
+        // plugin's toggle/popout default works with no discovery; mapping detected
+        // targets → IPC actions only happens if the user explicitly opts in (which
+        // sets ipcLoaded and re-runs _buildPluginCommands via _parseIpcHelp). The
+        // QML target-name scan below is harmless (local find|grep, no IPC).
         // Built-ins have no plugin directory — they use the standard toggle.
         const plugin = pluginService?.availablePlugins?.[pluginId]
         const dir = plugin?.pluginDirectory
@@ -239,9 +257,20 @@ PluginSettings {
     // Helpers
     ListModel { id: localItemsModel }
 
+    // Items for the level currently being edited: the variant's root items, or
+    // — when drilled in — the children of the submenu at editingSubmenuIndex.
+    function _levelItems() {
+        const rootItems = editingVariant?.items ?? []
+        if (editingSubmenuIndex >= 0 && editingSubmenuIndex < rootItems.length) {
+            const sm = rootItems[editingSubmenuIndex]
+            return (sm && sm.items) ? sm.items : []
+        }
+        return rootItems
+    }
+
     function _syncItemsModel() {
         localItemsModel.clear()
-        const items = editingVariant?.items ?? []
+        const items = _levelItems()
         for (let i = 0; i < items.length; i++) {
             const it = items[i]
             localItemsModel.append({
@@ -251,17 +280,66 @@ PluginSettings {
                 icommand:  it.command   || "",
                 ipluginId: it.pluginId  || "",
                 iwidgetId: it.widgetId  || "",
-                idisplay:  it.display   || "both"
+                idisplay:  it.display   || "both",
+                // Submenu children round-trip as JSON — ListModel can't hold
+                // nested arrays; the drill-in editor rebuilds them from here.
+                isubJson:  JSON.stringify(it.items || [])
             })
         }
     }
 
+    // Persist the current level's items back into the variant. At root that's a
+    // straight write; drilled in, it splices the children into their submenu and
+    // writes the whole root array (submenu icon/label preserved via assign).
     function _saveItems(items) {
         if (!editingVariantId || !pluginService) return
-        updateVariant(editingVariantId, { items: items })
+        let rootItems
+        if (editingSubmenuIndex >= 0) {
+            rootItems = (editingVariant?.items ?? []).slice()
+            if (editingSubmenuIndex < rootItems.length)
+                rootItems[editingSubmenuIndex] = Object.assign({}, rootItems[editingSubmenuIndex], { items: items })
+        } else {
+            rootItems = items
+        }
+        updateVariant(editingVariantId, { items: rootItems })
         // Update the local model immediately — don't wait for the reactive chain
-        editingVariant = Object.assign({}, editingVariant, { items: items })
+        editingVariant = Object.assign({}, editingVariant, { items: rootItems })
         _syncItemsModel()
+    }
+
+    // ── Sub-menu drill-in navigation ─────────────────────────────────────────
+    function _drillInto(index) {
+        const r = localItemsModel.get(index)
+        if (!r || r.itype !== "submenu") return
+        editingSubmenuIndex = index
+        editingSubmenuLabel = r.ilabel || "Sub-menu"
+        _resetItemForm()
+        _syncItemsModel()
+        submenuNameField.text = r.ilabel || ""
+        submenuIconPicker.currentIcon = r.iicon || "folder"
+    }
+
+    function _drillOut() {
+        editingSubmenuIndex = -1
+        editingSubmenuLabel = ""
+        _resetItemForm()
+        _syncItemsModel()
+    }
+
+    // Rename / re-icon the submenu we're drilled into (children untouched).
+    function _saveSubmenuMeta() {
+        if (!editingVariantId || !pluginService || editingSubmenuIndex < 0) return
+        const rootItems = (editingVariant?.items ?? []).slice()
+        if (editingSubmenuIndex >= rootItems.length) return
+        const label = submenuNameField.text.trim()
+        const sm = Object.assign({}, rootItems[editingSubmenuIndex], {
+            icon: submenuIconPicker.currentIcon,
+            label: label
+        })
+        rootItems[editingSubmenuIndex] = sm
+        updateVariant(editingVariantId, { items: rootItems })
+        editingVariant = Object.assign({}, editingVariant, { items: rootItems })
+        editingSubmenuLabel = label || "Sub-menu"
     }
 
     function _currentItems() {
@@ -269,7 +347,9 @@ PluginSettings {
         for (let i = 0; i < localItemsModel.count; i++) {
             const r = localItemsModel.get(i)
             const obj = { type: r.itype, icon: r.iicon, label: r.ilabel, display: r.idisplay }
-            if (r.itype === "action") {
+            if (r.itype === "submenu") {
+                obj.items = JSON.parse(r.isubJson || "[]")   // preserve nested children
+            } else if (r.itype === "action") {
                 obj.command = r.icommand
                 // IPC actions sourced from a plugin carry the owning pluginId so the
                 // widget can instantiate it off-bar (keeping its IpcHandler live).
@@ -285,6 +365,8 @@ PluginSettings {
         editingVariantId = variant.id
         editingVariant = variant
         editingPillDisplay = variant.pillDisplay || "both"
+        editingSubmenuIndex = -1   // always land at the variant's root level
+        editingSubmenuLabel = ""
         _syncItemsModel()
         // Populate the meta-edit fields
         editNameField.text = variant.name || ""
@@ -323,11 +405,19 @@ PluginSettings {
         ipcTargetPicker.currentValue = ""
         ipcFunctionPicker.currentValue = ""
         pluginPicker.currentValue = ""
+        submenuFormIcon.currentIcon = ""
+        submenuFormLabel.text = ""
     }
 
     function _editItem(index) {
         const r = localItemsModel.get(index)
         if (!r) return
+        if (r.itype === "submenu") {
+            // A submenu row isn't edited via the form — clicking it drills into
+            // its children (rename/re-icon happens in the drilled-in header).
+            _drillInto(index)
+            return
+        }
         _resetItemForm()
         editingItemIndex = index
         newItemDisplay = r.idisplay || "both"
@@ -813,17 +903,19 @@ PluginSettings {
             anchors.margins: Theme.spacingL
             spacing: Theme.spacingM
 
-            // Editable variant metadata
+            // Editable variant metadata (root level only)
             StyledText {
                 text: "Dropdown Settings"
                 font.pixelSize: Theme.fontSizeMedium
                 font.weight: Font.Medium
                 color: Theme.surfaceText
+                visible: root._atRoot
             }
 
             Row {
                 width: parent.width
                 spacing: Theme.spacingM
+                visible: root._atRoot
 
                 Column {
                     width: (parent.width - Theme.spacingM * 2) / 3
@@ -864,6 +956,7 @@ PluginSettings {
             // Bar pill display mode
             Row {
                 spacing: Theme.spacingS
+                visible: root._atRoot
 
                 StyledText {
                     text: "Bar pill shows:"
@@ -892,9 +985,71 @@ PluginSettings {
                 }
             }
 
+            // ── Drilled-in sub-menu header (breadcrumb + rename) ──────────────
+            Column {
+                width: parent.width
+                spacing: Theme.spacingS
+                visible: !root._atRoot
+
+                // Breadcrumb / back
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingS
+
+                    DankButton {
+                        text: "Back"
+                        iconName: "arrow_back"
+                        buttonHeight: 32
+                        backgroundColor: Theme.surfaceContainerHigh
+                        textColor: Theme.surfaceText
+                        onClicked: root._drillOut()
+                    }
+
+                    StyledText {
+                        text: (root.editingVariant?.name || "Menu") + "  ›  " + (root.editingSubmenuLabel || "Sub-menu")
+                        font.pixelSize: Theme.fontSizeMedium
+                        font.weight: Font.Medium
+                        color: Theme.surfaceText
+                        elide: Text.ElideRight
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.spacingS - 100
+                    }
+                }
+
+                // Rename / re-icon this sub-menu
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingM
+
+                    Column {
+                        width: (parent.width - Theme.spacingM) / 2
+                        spacing: Theme.spacingXS
+                        StyledText { text: "Sub-menu icon"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                        DropdownIconPicker {
+                            id: submenuIconPicker
+                            width: parent.width
+                            currentIcon: "folder"
+                            onIconSelected: (name) => root._saveSubmenuMeta()
+                        }
+                    }
+
+                    Column {
+                        width: (parent.width - Theme.spacingM) / 2
+                        spacing: Theme.spacingXS
+                        StyledText { text: "Sub-menu name"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                        DankTextField {
+                            id: submenuNameField
+                            width: parent.width
+                            placeholderText: "Group name"
+                            onEditingFinished: root._saveSubmenuMeta()
+                        }
+                    }
+                }
+            }
+
             // Current items
             StyledText {
-                text: "Menu Items"
+                text: root._atRoot ? "Menu Items" : "Sub-menu Items"
                 font.pixelSize: Theme.fontSizeSmall
                 font.weight: Font.Medium
                 color: Theme.surfaceVariantText
@@ -984,14 +1139,18 @@ PluginSettings {
                     required property string ipluginId
                     required property string iwidgetId
                     required property string idisplay
+                    required property string isubJson
                     required property int index
 
                     readonly property string _idRef: itype === "popout" ? iwidgetId : ipluginId
+                    readonly property int _subCount: itype === "submenu"
+                        ? JSON.parse(isubJson || "[]").length : 0
 
                     readonly property string resolvedIcon: iicon !== "" ? iicon
+                        : (itype === "submenu" ? "folder"
                         : ((itype === "plugin" || itype === "popout" || itype === "embed") && pluginService
                             ? (pluginService.availablePlugins[_idRef]?.icon || "extension")
-                            : "extension")
+                            : "extension"))
 
                     readonly property string resolvedLabel: ilabel !== "" ? ilabel
                         : ((itype === "plugin" || itype === "popout" || itype === "embed") && pluginService
@@ -1141,8 +1300,10 @@ PluginSettings {
 
                                 StyledText {
                                     width: subtitleRow.width - typeBadgeRect.width - displayBadgeRect.width - Theme.spacingXS * 2
-                                    text: itype === "action" ? icommand
-                                        : (itype === "popout" ? iwidgetId : ipluginId)
+                                    text: itype === "submenu"
+                                        ? (_subCount + (_subCount === 1 ? " item" : " items") + " · click to open")
+                                        : (itype === "action" ? icommand
+                                        : (itype === "popout" ? iwidgetId : ipluginId))
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.surfaceVariantText
                                     elide: Text.ElideRight
@@ -1305,11 +1466,9 @@ PluginSettings {
                     buttonHeight: 32
                     backgroundColor: root.newItemType === "plugin" ? Theme.primary : Theme.surfaceContainerHigh
                     textColor: root.newItemType === "plugin" ? Theme.onPrimary : Theme.surfaceText
-                    onClicked: {
-                        root.newItemType = "plugin"
-                        if (!root.ipcLoaded && !root.ipcLoading)
-                            root._loadIpcTargets()
-                    }
+                    // No auto IPC discovery — toggle/popout needs none, and
+                    // `dms ipc --help` can crash the shell (see _detectPluginCommands).
+                    onClicked: root.newItemType = "plugin"
                 }
 
                 DankButton {
@@ -1317,10 +1476,63 @@ PluginSettings {
                     buttonHeight: 32
                     backgroundColor: root.newItemType === "ipc" ? Theme.primary : Theme.surfaceContainerHigh
                     textColor: root.newItemType === "ipc" ? Theme.onPrimary : Theme.surfaceText
-                    onClicked: {
-                        root.newItemType = "ipc"
-                        if (!root.ipcLoaded && !root.ipcLoading)
-                            root._loadIpcTargets()
+                    // Discovery is opt-in via the "Load IPC targets" button in the form.
+                    onClicked: root.newItemType = "ipc"
+                }
+
+                // Sub-menus only nest one level, so this is hidden once drilled in.
+                DankButton {
+                    text: "Sub-menu"
+                    iconName: "folder"
+                    buttonHeight: 32
+                    visible: root._atRoot
+                    backgroundColor: root.newItemType === "submenu" ? Theme.primary : Theme.surfaceContainerHigh
+                    textColor: root.newItemType === "submenu" ? Theme.onPrimary : Theme.surfaceText
+                    onClicked: root.newItemType = "submenu"
+                }
+            }
+
+            // Sub-menu fields — a group is just a label + icon; children are added
+            // by creating it, then clicking it in the list to drill in.
+            Column {
+                width: parent.width
+                spacing: Theme.spacingS
+                visible: root.newItemType === "submenu"
+
+                StyledText {
+                    width: parent.width
+                    text: "Create an empty group, then click it in the list above to add items inside it."
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    wrapMode: Text.WordWrap
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingM
+
+                    Column {
+                        width: (parent.width - Theme.spacingM) / 2
+                        spacing: Theme.spacingXS
+                        StyledText { text: "Icon (optional)"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                        DropdownIconPicker {
+                            id: submenuFormIcon
+                            width: parent.width
+                            currentIcon: ""
+                            onIconSelected: (name) => root.newItemIcon = name
+                        }
+                    }
+
+                    Column {
+                        width: (parent.width - Theme.spacingM) / 2
+                        spacing: Theme.spacingXS
+                        StyledText { text: "Name"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                        DankTextField {
+                            id: submenuFormLabel
+                            width: parent.width
+                            placeholderText: "e.g. Power, Media…"
+                            onTextChanged: root.newItemLabel = text
+                        }
                     }
                 }
             }
@@ -1453,6 +1665,30 @@ PluginSettings {
                         }
                     }
 
+                    // Opt-in IPC-action discovery. Left off by default because
+                    // `dms ipc --help` enumerates every handler and can crash the
+                    // shell (upstream quickshell wireDef segfault). Toggle/open
+                    // needs none of this.
+                    DankButton {
+                        visible: root.newItemPluginId !== "" && !root.ipcLoaded
+                        text: root.ipcLoading ? "Scanning…" : "Detect IPC actions…"
+                        iconName: "search"
+                        buttonHeight: 32
+                        enabled: !root.ipcLoading
+                        backgroundColor: Theme.surfaceContainerHigh
+                        textColor: Theme.surfaceText
+                        onClicked: root._loadIpcTargets()
+                    }
+
+                    StyledText {
+                        visible: root.newItemPluginId !== "" && !root.ipcLoaded && !root.ipcLoading
+                        width: parent.width
+                        text: "Optional — scans DMS IPC targets so this plugin's IPC actions can be offered. Skip it if you only need toggle / open. ⚠ On some setups IPC discovery can crash the shell (a known quickshell bug)."
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceVariantText
+                        wrapMode: Text.WordWrap
+                    }
+
                     StyledText {
                         visible: {
                             root._pluginStateRev
@@ -1518,15 +1754,26 @@ PluginSettings {
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
+                    // Loading is user-initiated: `dms ipc --help` enumerates every
+                    // handler and can crash the shell (upstream wireDef segfault).
                     DankButton {
                         id: refreshIpcBtn
-                        text: root.ipcLoading ? "Loading…" : "Refresh"
+                        text: root.ipcLoading ? "Loading…" : (root.ipcLoaded ? "Refresh" : "Load IPC targets")
                         iconName: "refresh"
                         buttonHeight: 32
                         enabled: !root.ipcLoading
                         onClicked: root._loadIpcTargets()
                         anchors.verticalCenter: parent.verticalCenter
                     }
+                }
+
+                StyledText {
+                    visible: !root.ipcLoaded && !root.ipcLoading
+                    width: parent.width
+                    text: "Click “Load IPC targets” to list available commands. ⚠ Discovery scans all IPC handlers and can crash the shell on some setups (a known quickshell bug). Already know the command? You can add it as a Custom Action instead (e.g. dms ipc <target> <function>)."
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    wrapMode: Text.WordWrap
                 }
 
                 Row {
@@ -1540,7 +1787,7 @@ PluginSettings {
                         DankDropdown {
                             id: ipcTargetPicker
                             width: parent.width
-                            emptyText: root.ipcLoaded ? "Select target…" : "Loading…"
+                            emptyText: root.ipcLoaded ? "Select target…" : (root.ipcLoading ? "Loading…" : "Load targets first")
                             options: root.ipcTargetNames
                             onValueChanged: (value) => {
                                 root.newItemIpcTarget = value
@@ -1671,7 +1918,19 @@ PluginSettings {
                     iconName: root.editingItemIndex >= 0 ? "check" : "add"
                     onClicked: {
                         let newItem = null
-                        if (root.newItemType === "action") {
+                        if (root.newItemType === "submenu") {
+                            if (!root.newItemLabel) {
+                                ToastService.showError("Please enter a name for the sub-menu")
+                                return
+                            }
+                            newItem = {
+                                type: "submenu",
+                                icon: root.newItemIcon,
+                                label: root.newItemLabel,
+                                display: root.newItemDisplay,
+                                items: []   // children added by drilling in
+                            }
+                        } else if (root.newItemType === "action") {
                             if (!root.newItemCommand) {
                                 ToastService.showError("Please enter a shell command")
                                 return

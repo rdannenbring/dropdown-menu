@@ -31,7 +31,35 @@ PluginComponent {
     readonly property bool pillShowLabel: pillDisplay !== "icon" && pillText !== ""
 
     popoutWidth: 280
-    popoutHeight: Math.max(64, menuItems.length * 48 + 16)
+
+    // Accordion expansion state, keyed by top-level item index → bool. Lives on
+    // root (not in the ephemeral popout content) so popoutHeight can see it.
+    readonly property int _rowH: 48
+    property var _expandedSubmenus: ({})
+    onMenuItemsChanged: _expandedSubmenus = ({})   // stale indices if items change
+
+    function _toggleSubmenu(index) {
+        const m = Object.assign({}, _expandedSubmenus)
+        m[index] = !m[index]
+        _expandedSubmenus = m
+    }
+
+    // Grow to fit expanded submenus: one row per top-level item, plus each
+    // expanded submenu's children. (One level; deeper nesting would recurse.)
+    popoutHeight: {
+        let rows = 0
+        for (var i = 0; i < menuItems.length; i++) {
+            rows += 1
+            const it = menuItems[i]
+            if (it && it.type === "submenu" && _expandedSubmenus[i] && it.items)
+                rows += it.items.length
+        }
+        return Math.max(64, rows * _rowH + 16)
+    }
+
+    Behavior on popoutHeight {
+        NumberAnimation { duration: Theme.shortDuration; easing.type: Easing.OutCubic }
+    }
 
     // Plugin/widget ids to instantiate off-bar so menu items work without the
     // widget being on a bar:
@@ -41,12 +69,20 @@ PluginComponent {
     readonly property var _hostedTargets: {
         const out = []
         const add = (id) => { if (id && out.indexOf(id) < 0) out.push(id) }
-        for (var i = 0; i < menuItems.length; i++) {
-            const it = menuItems[i]
-            if (!it) continue
-            if (it.type === "popout" && it.widgetId) add(it.widgetId)
-            else if (it.type === "action" && it.pluginId) add(it.pluginId)
+        // Recurse into submenu children so nested popout/IPC items host off-bar
+        // too. Depth is unbounded here even though rendering is one level; this
+        // stays a flat, de-duped target list (compatible with lazy hosting, #2).
+        const walk = (items) => {
+            if (!items) return
+            for (var i = 0; i < items.length; i++) {
+                const it = items[i]
+                if (!it) continue
+                if (it.type === "submenu") walk(it.items)
+                else if (it.type === "popout" && it.widgetId) add(it.widgetId)
+                else if (it.type === "action" && it.pluginId) add(it.pluginId)
+            }
         }
+        walk(menuItems)
         return out
     }
 
@@ -231,11 +267,28 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
+            id: popoutRoot
             showCloseButton: false
 
             Process {
                 id: actionProcess
                 running: false
+            }
+
+            // Shared dispatch so submenu headers and nested children reuse it.
+            function _dispatchAction(command) {
+                actionProcess.command = ["sh", "-c", command]
+                actionProcess.running = true
+                root.closePopout()
+            }
+            function _dispatchPlugin(pluginId) {
+                root._triggerPlugin(pluginId)
+                root.closePopout()
+            }
+            function _dispatchPopout(widgetId) {
+                root.closePopout()
+                if (!root._openWidgetPopout(widgetId))
+                    ToastService.showWarning("Couldn't open " + widgetId + " — it isn't an installed widget plugin")
             }
 
             Column {
@@ -247,31 +300,70 @@ PluginComponent {
                 Repeater {
                     model: root.menuItems
 
-                    delegate: DropdownItem {
+                    // Each top-level entry is a header/leaf row plus, for a
+                    // submenu, an animated container of its indented children.
+                    delegate: Column {
+                        id: itemGroup
                         required property var modelData
                         required property int index
 
                         width: parent.width
-                        item: modelData
-                        display: modelData.display || "both"
-                        pluginService: root.pluginService
-                        popoutService: root.popoutService
+                        spacing: 2
 
-                        onExecuteAction: (command) => {
-                            actionProcess.command = ["sh", "-c", command]
-                            actionProcess.running = true
-                            root.closePopout()
+                        readonly property bool isSubmenu: modelData && modelData.type === "submenu"
+                        readonly property var subItems: (isSubmenu && modelData.items) ? modelData.items : []
+
+                        DropdownItem {
+                            width: parent.width
+                            item: itemGroup.modelData
+                            display: (itemGroup.modelData && itemGroup.modelData.display) || "both"
+                            pluginService: root.pluginService
+                            popoutService: root.popoutService
+                            expanded: !!root._expandedSubmenus[itemGroup.index]
+
+                            onToggleExpand: root._toggleSubmenu(itemGroup.index)
+                            onExecuteAction: (command) => popoutRoot._dispatchAction(command)
+                            onExecutePlugin: (pluginId) => popoutRoot._dispatchPlugin(pluginId)
+                            onExecutePopout: (widgetId) => popoutRoot._dispatchPopout(widgetId)
                         }
 
-                        onExecutePlugin: (pluginId) => {
-                            root._triggerPlugin(pluginId)
-                            root.closePopout()
-                        }
+                        // Nested children (one level). Deeper nesting would
+                        // recurse a submenu delegate in place of DropdownItem here.
+                        Item {
+                            width: parent.width
+                            clip: true
+                            visible: itemGroup.isSubmenu
+                            height: (itemGroup.isSubmenu && !!root._expandedSubmenus[itemGroup.index])
+                                ? childrenCol.implicitHeight : 0
 
-                        onExecutePopout: (widgetId) => {
-                            root.closePopout()
-                            if (!root._openWidgetPopout(widgetId))
-                                ToastService.showWarning("Couldn't open " + widgetId + " — it isn't an installed widget plugin")
+                            Behavior on height {
+                                NumberAnimation { duration: Theme.shortDuration; easing.type: Easing.OutCubic }
+                            }
+
+                            Column {
+                                id: childrenCol
+                                width: parent.width
+                                spacing: 2
+
+                                Repeater {
+                                    model: itemGroup.subItems
+
+                                    delegate: DropdownItem {
+                                        required property var modelData
+
+                                        width: parent.width
+                                        item: modelData
+                                        display: (modelData && modelData.display) || "both"
+                                        indent: Theme.spacingL
+                                        pluginService: root.pluginService
+                                        popoutService: root.popoutService
+
+                                        onExecuteAction: (command) => popoutRoot._dispatchAction(command)
+                                        onExecutePlugin: (pluginId) => popoutRoot._dispatchPlugin(pluginId)
+                                        onExecutePopout: (widgetId) => popoutRoot._dispatchPopout(widgetId)
+                                    }
+                                }
+                            }
                         }
                     }
                 }

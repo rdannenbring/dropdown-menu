@@ -14,12 +14,22 @@ PluginSettings {
     property string editingVariantId: ""
     property var editingVariant: null
 
-    // Drill-in navigation for sub-menus. -1 = editing the variant's root items;
-    // >=0 = editing that root submenu's children. One level for now: deeper
-    // nesting would make this a path (array of indices) instead of a single int.
-    property int editingSubmenuIndex: -1
-    property string editingSubmenuLabel: ""
-    readonly property bool _atRoot: editingSubmenuIndex < 0
+    // The item list shows the whole tree at once (unified indented view). The
+    // canonical data is editingVariant.items (nested JS); localItemsModel is a
+    // flat *projection* of it. Sub-menu folders expand/collapse in the editor
+    // via editorExpanded, keyed by the folder's root index.
+    property var editorExpanded: ({})
+    // Where the next added item lands: -1 = top level, >=0 = that root folder.
+    property int addTargetParent: -1
+    // Folders (root-level sub-menus), for the per-row "Move to" chooser.
+    readonly property var _folders: {
+        const out = []
+        const items = editingVariant?.items ?? []
+        for (let i = 0; i < items.length; i++)
+            if (items[i]?.type === "submenu")
+                out.push({ index: i, label: items[i].label || ("Folder " + (i + 1)) })
+        return out
+    }
 
     onVariantsChanged: {
         localVariantsModel.clear()
@@ -35,13 +45,6 @@ PluginSettings {
         if (editingVariantId !== "") {
             const found = variants.find(v => v.id === editingVariantId) || null
             editingVariant = found
-            // If an external change removed/retyped the submenu we're inside, pop
-            // back to root so we don't edit a phantom level.
-            if (editingSubmenuIndex >= 0) {
-                const rootItems = found?.items ?? []
-                const sm = rootItems[editingSubmenuIndex]
-                if (!sm || sm.type !== "submenu") _drillOut()
-            }
             _syncItemsModel()
         }
     }
@@ -54,6 +57,12 @@ PluginSettings {
     property string newVariantName: ""
     property string newVariantIcon: "expand_circle_down"
     property string newVariantText: ""
+    property string newVariantPill: "both"
+
+    // Unsaved-changes guard: snapshot the form on open, compare on close-attempt.
+    property string _confirmTarget: ""       // "item" | "create"
+    property string _itemOpenSnapshot: ""
+    property string _createOpenSnapshot: ""
 
     // New Item Form state
     property string newItemType: "action"
@@ -66,7 +75,11 @@ PluginSettings {
     property string newItemActionPluginId: ""
     property string newItemDisplay: "both"
     property string editingPillDisplay: "both"
-    property int editingItemIndex: -1   // -1 = adding new; >=0 = editing that item
+    // Path of the item being edited: parent = -1 (top level) or a folder's root
+    // index; pos = index within that level. pos < 0 means "adding new".
+    property int editingParent: -1
+    property int editingPos: -1
+    readonly property bool _isEditing: editingPos >= 0
 
     // IPC discovery state
     property string newItemIpcTarget: ""
@@ -257,116 +270,232 @@ PluginSettings {
     // Helpers
     ListModel { id: localItemsModel }
 
-    // Items for the level currently being edited: the variant's root items, or
-    // — when drilled in — the children of the submenu at editingSubmenuIndex.
-    function _levelItems() {
-        const rootItems = editingVariant?.items ?? []
-        if (editingSubmenuIndex >= 0 && editingSubmenuIndex < rootItems.length) {
-            const sm = rootItems[editingSubmenuIndex]
-            return (sm && sm.items) ? sm.items : []
-        }
-        return rootItems
+    // ── Flat projection of the nested tree ───────────────────────────────────
+    // localItemsModel holds one row per visible item across the whole tree, each
+    // tagged with its path: rDepth (0/1), rParent (folder root index or -1),
+    // rPos (index within its level). Sub-menu children only appear when that
+    // folder is expanded in the editor. Deeper nesting would recurse here.
+    // grp/top/bot mark rows that belong to an expanded folder's shaded band
+    // (the header + its children), and which row is the band's top/bottom edge.
+    function _appendRow(it, depth, parent, pos, grp, top, bot) {
+        localItemsModel.append({
+            itype:     it.type      || "action",
+            iicon:     it.icon      || "",
+            ilabel:    it.label     || "",
+            icommand:  it.command   || "",
+            ipluginId: it.pluginId  || "",
+            iwidgetId: it.widgetId  || "",
+            idisplay:  it.display   || "both",
+            isubJson:  JSON.stringify(it.items || []),
+            rDepth: depth, rParent: parent, rPos: pos,
+            rGroupBg: grp === true, rGroupTop: top === true, rGroupBottom: bot === true
+        })
     }
 
     function _syncItemsModel() {
         localItemsModel.clear()
-        const items = _levelItems()
-        for (let i = 0; i < items.length; i++) {
-            const it = items[i]
-            localItemsModel.append({
-                itype:     it.type      || "action",
-                iicon:     it.icon      || "",
-                ilabel:    it.label     || "",
-                icommand:  it.command   || "",
-                ipluginId: it.pluginId  || "",
-                iwidgetId: it.widgetId  || "",
-                idisplay:  it.display   || "both",
-                // Submenu children round-trip as JSON — ListModel can't hold
-                // nested arrays; the drill-in editor rebuilds them from here.
-                isubJson:  JSON.stringify(it.items || [])
-            })
+        const items = editingVariant?.items ?? []
+        for (let ri = 0; ri < items.length; ri++) {
+            const it = items[ri]
+            const expanded = it && it.type === "submenu" && !!editorExpanded[ri]
+            const kids = expanded ? (it.items || []) : []
+            _appendRow(it, 0, -1, ri, expanded, expanded, expanded && kids.length === 0)
+            for (let ci = 0; ci < kids.length; ci++)
+                _appendRow(kids[ci], 1, ri, ci, true, false, ci === kids.length - 1)
         }
     }
 
-    // Persist the current level's items back into the variant. At root that's a
-    // straight write; drilled in, it splices the children into their submenu and
-    // writes the whole root array (submenu icon/label preserved via assign).
-    function _saveItems(items) {
+    // ── Tree mutation (clone → edit by path → commit → re-project) ────────────
+    function _cloneTree() { return JSON.parse(JSON.stringify(editingVariant?.items ?? [])) }
+
+    function _commitTree(tree) {
         if (!editingVariantId || !pluginService) return
-        let rootItems
-        if (editingSubmenuIndex >= 0) {
-            rootItems = (editingVariant?.items ?? []).slice()
-            if (editingSubmenuIndex < rootItems.length)
-                rootItems[editingSubmenuIndex] = Object.assign({}, rootItems[editingSubmenuIndex], { items: items })
+        updateVariant(editingVariantId, { items: tree })
+        editingVariant = Object.assign({}, editingVariant, { items: tree })
+        _syncItemsModel()
+    }
+
+    // The items array for a level in `tree`: root (parent<0) or a folder's items.
+    function _levelOf(tree, parent) {
+        if (parent < 0) return tree
+        const f = tree[parent]
+        if (!f.items) f.items = []
+        return f.items
+    }
+
+    // editorExpanded is keyed by root index, so removing a root item shifts keys.
+    function _expandedAfterRootRemove(removed) {
+        const out = {}
+        for (const k in editorExpanded) {
+            if (!editorExpanded[k]) continue
+            const i = parseInt(k)
+            if (i < removed) out[i] = true
+            else if (i > removed) out[i - 1] = true
+        }
+        return out
+    }
+
+    function _addItemAt(parent, item) {
+        const tree = _cloneTree()
+        _levelOf(tree, parent).push(item)
+        if (parent >= 0) { const m = Object.assign({}, editorExpanded); m[parent] = true; editorExpanded = m }
+        _commitTree(tree)
+    }
+
+    function _updateItemAt(parent, pos, item) {
+        const tree = _cloneTree()
+        const lvl = _levelOf(tree, parent)
+        if (pos < 0 || pos >= lvl.length) return
+        // Editing a folder's meta shouldn't drop its children.
+        if (item.type === "submenu" && item.items === undefined
+            && lvl[pos] && lvl[pos].type === "submenu")
+            item.items = lvl[pos].items || []
+        lvl[pos] = item
+        _commitTree(tree)
+    }
+
+    function _removeItemAt(parent, pos) {
+        const tree = _cloneTree()
+        const lvl = _levelOf(tree, parent)
+        if (pos < 0 || pos >= lvl.length) return
+        lvl.splice(pos, 1)
+        if (parent < 0) editorExpanded = _expandedAfterRootRemove(pos)
+        _commitTree(tree)
+    }
+
+    function _reorderWithinLevel(parent, fromPos, toPos) {
+        const tree = _cloneTree()
+        const lvl = _levelOf(tree, parent)
+        if (fromPos < 0 || fromPos >= lvl.length) return
+        if (toPos < 0) toPos = 0
+        if (toPos > lvl.length) toPos = lvl.length
+        if (toPos === fromPos || toPos === fromPos + 1) return
+        // Track folder expansion across a root-level reorder.
+        let flags = null
+        if (parent < 0) flags = lvl.map((_, i) => !!editorExpanded[i])
+        let insert = toPos
+        const moved = lvl.splice(fromPos, 1)[0]
+        if (insert > fromPos) insert -= 1
+        lvl.splice(insert, 0, moved)
+        if (flags) {
+            const mf = flags.splice(fromPos, 1)[0]
+            flags.splice(insert, 0, mf)
+            const m = {}; flags.forEach((f, i) => { if (f) m[i] = true }); editorExpanded = m
+        }
+        _commitTree(tree)
+    }
+
+    // Move an item to the end of another level. One level: a folder can't be
+    // moved into a folder. Capture the destination array *before* splicing the
+    // source (object refs stay valid; the folder's root index may shift).
+    function _moveItem(fromParent, fromPos, destParent) {
+        if (fromParent === destParent) return
+        const tree = _cloneTree()
+        const destLevel = _levelOf(tree, destParent)
+        const src = _levelOf(tree, fromParent)
+        if (fromPos < 0 || fromPos >= src.length) return
+        const moving = src[fromPos]
+        if (moving.type === "submenu" && destParent >= 0) return
+        src.splice(fromPos, 1)
+        destLevel.push(moving)
+        let newDest = destParent
+        if (fromParent < 0) {
+            editorExpanded = _expandedAfterRootRemove(fromPos)
+            if (destParent >= 0 && fromPos < destParent) newDest = destParent - 1
+        }
+        if (newDest >= 0) { const m = Object.assign({}, editorExpanded); m[newDest] = true; editorExpanded = m }
+        _commitTree(tree)
+    }
+
+    function _toggleEditorExpand(rootIndex) {
+        const m = Object.assign({}, editorExpanded)
+        m[rootIndex] = !m[rootIndex]
+        editorExpanded = m
+        _syncItemsModel()
+    }
+
+    function _resetCreateForm() {
+        newVariantName = ""
+        newVariantIcon = "expand_circle_down"
+        newVariantText = ""
+        newVariantPill = "both"
+        variantNameField.text = ""
+        variantTextField.text = ""
+        variantIconField.currentIcon = "expand_circle_down"
+    }
+
+    // ── Dialog save + unsaved-changes handling ───────────────────────────────
+    function _itemFormSnapshot() {
+        return JSON.stringify([newItemType, newItemIcon, newItemLabel, newItemCommand,
+            newItemPluginId, newItemActionPluginId, newItemDisplay, newPluginActionKind,
+            newPluginCmdTarget, newPluginCmdFn, newItemIpcTarget, newItemIpcFunction, newItemIpcArgs])
+    }
+    function _createFormSnapshot() {
+        return JSON.stringify([newVariantName, newVariantIcon, newVariantText, newVariantPill])
+    }
+    // Outside-click / close request: prompt only if the form changed since open.
+    function _tryCloseItemDialog() {
+        if (_itemFormSnapshot() !== _itemOpenSnapshot) { _confirmTarget = "item"; confirmPopup.open() }
+        else addItemPopup.close()
+    }
+    function _tryCloseCreateDialog() {
+        if (_createFormSnapshot() !== _createOpenSnapshot) { _confirmTarget = "create"; confirmPopup.open() }
+        else createDropdownPopup.close()
+    }
+
+    // Build + persist the item form; on validation failure it toasts and leaves
+    // the dialog open (early return). Shared by the dialog's button and the
+    // unsaved-changes "Save".
+    function _commitItemForm() {
+        let newItem = null
+        if (newItemType === "submenu") {
+            if (!newItemLabel) { ToastService.showError("Please enter a name for the sub-menu"); return }
+            newItem = { type: "submenu", icon: newItemIcon, label: newItemLabel, display: newItemDisplay }
+        } else if (newItemType === "action") {
+            if (!newItemCommand) { ToastService.showError("Please enter a shell command"); return }
+            if (!newItemLabel) { ToastService.showError("Please enter a label"); return }
+            newItem = { type: "action", icon: newItemIcon, label: newItemLabel, command: newItemCommand, display: newItemDisplay }
+            if (newItemActionPluginId) newItem.pluginId = newItemActionPluginId
+        } else if (newItemType === "ipc") {
+            if (!newItemIpcTarget || !newItemIpcFunction) { ToastService.showError("Please select an IPC target and function"); return }
+            newItem = { type: "action", icon: newItemIcon, label: newItemLabel || (newItemIpcTarget + ": " + newItemIpcFunction), command: ipcCommandPreview, display: newItemDisplay }
         } else {
-            rootItems = items
+            if (!newItemPluginId) { ToastService.showError("Please select a plugin"); return }
+            const pName = (availablePluginList.find(p => p.id === newItemPluginId) || {}).name || newItemPluginId
+            if (newPluginActionKind === "ipc" && newPluginCmdFn) {
+                newItem = { type: "action", icon: newItemIcon, label: newItemLabel || (pName + ": " + newPluginCmdFn), command: "dms ipc " + newPluginCmdTarget + " " + newPluginCmdFn, pluginId: newItemPluginId, display: newItemDisplay }
+            } else if (newPluginActionKind === "popout") {
+                newItem = { type: "popout", icon: newItemIcon, label: newItemLabel, widgetId: newItemPluginId, display: newItemDisplay }
+            } else {
+                newItem = { type: "plugin", icon: newItemIcon, label: newItemLabel, pluginId: newItemPluginId, display: newItemDisplay }
+            }
         }
-        updateVariant(editingVariantId, { items: rootItems })
-        // Update the local model immediately — don't wait for the reactive chain
-        editingVariant = Object.assign({}, editingVariant, { items: rootItems })
-        _syncItemsModel()
-    }
-
-    // ── Sub-menu drill-in navigation ─────────────────────────────────────────
-    function _drillInto(index) {
-        const r = localItemsModel.get(index)
-        if (!r || r.itype !== "submenu") return
-        editingSubmenuIndex = index
-        editingSubmenuLabel = r.ilabel || "Sub-menu"
+        const wasEditing = _isEditing
+        if (wasEditing) _updateItemAt(editingParent, editingPos, newItem)
+        else _addItemAt(addTargetParent, newItem)
         _resetItemForm()
-        _syncItemsModel()
-        submenuNameField.text = r.ilabel || ""
-        submenuIconPicker.currentIcon = r.iicon || "folder"
+        addItemPopup.close()
+        ToastService.showInfo(wasEditing ? "Item updated" : "Item added")
     }
 
-    function _drillOut() {
-        editingSubmenuIndex = -1
-        editingSubmenuLabel = ""
-        _resetItemForm()
-        _syncItemsModel()
-    }
-
-    // Rename / re-icon the submenu we're drilled into (children untouched).
-    function _saveSubmenuMeta() {
-        if (!editingVariantId || !pluginService || editingSubmenuIndex < 0) return
-        const rootItems = (editingVariant?.items ?? []).slice()
-        if (editingSubmenuIndex >= rootItems.length) return
-        const label = submenuNameField.text.trim()
-        const sm = Object.assign({}, rootItems[editingSubmenuIndex], {
-            icon: submenuIconPicker.currentIcon,
-            label: label
-        })
-        rootItems[editingSubmenuIndex] = sm
-        updateVariant(editingVariantId, { items: rootItems })
-        editingVariant = Object.assign({}, editingVariant, { items: rootItems })
-        editingSubmenuLabel = label || "Sub-menu"
-    }
-
-    function _currentItems() {
-        const items = []
-        for (let i = 0; i < localItemsModel.count; i++) {
-            const r = localItemsModel.get(i)
-            const obj = { type: r.itype, icon: r.iicon, label: r.ilabel, display: r.idisplay }
-            if (r.itype === "submenu") {
-                obj.items = JSON.parse(r.isubJson || "[]")   // preserve nested children
-            } else if (r.itype === "action") {
-                obj.command = r.icommand
-                // IPC actions sourced from a plugin carry the owning pluginId so the
-                // widget can instantiate it off-bar (keeping its IpcHandler live).
-                if (r.ipluginId) obj.pluginId = r.ipluginId
-            } else if (r.itype === "popout") obj.widgetId = r.iwidgetId
-            else obj.pluginId = r.ipluginId   // plugin | embed
-            items.push(obj)
-        }
-        return items
+    function _commitCreateForm() {
+        const nm = newVariantName.trim()
+        if (!nm) { ToastService.showError("Please enter a name for the dropdown"); return }
+        const cfg = { icon: newVariantIcon || "expand_circle_down", text: newVariantText, pillDisplay: newVariantPill, items: [] }
+        const newId = createVariant(nm, cfg)
+        if (!newId) { ToastService.showError("Failed to save — plugin service unavailable"); return }
+        Qt.callLater(() => pluginService.reloadPlugin("dropdownMenu"))
+        _selectVariant({ id: newId, name: nm, icon: cfg.icon, text: cfg.text, pillDisplay: cfg.pillDisplay, items: [] })
+        ToastService.showInfo("Dropdown created: " + nm)
+        createDropdownPopup.close()
     }
 
     function _selectVariant(variant) {
         editingVariantId = variant.id
         editingVariant = variant
         editingPillDisplay = variant.pillDisplay || "both"
-        editingSubmenuIndex = -1   // always land at the variant's root level
-        editingSubmenuLabel = ""
+        editorExpanded = ({})       // start collapsed
+        addTargetParent = -1        // add to top level by default
         _syncItemsModel()
         // Populate the meta-edit fields
         editNameField.text = variant.name || ""
@@ -377,7 +506,8 @@ PluginSettings {
     }
 
     function _resetItemForm() {
-        editingItemIndex = -1
+        editingParent = -1
+        editingPos = -1
         newItemType = "action"
         newItemIcon = ""
         newItemLabel = ""
@@ -412,18 +542,19 @@ PluginSettings {
     function _editItem(index) {
         const r = localItemsModel.get(index)
         if (!r) return
-        if (r.itype === "submenu") {
-            // A submenu row isn't edited via the form — clicking it drills into
-            // its children (rename/re-icon happens in the drilled-in header).
-            _drillInto(index)
-            return
-        }
         _resetItemForm()
-        editingItemIndex = index
+        editingParent = r.rParent
+        editingPos = r.rPos
         newItemDisplay = r.idisplay || "both"
         newItemIcon = r.iicon || ""
         newItemLabel = r.ilabel || ""
-        if (r.itype === "action") {
+        if (r.itype === "submenu") {
+            // Edit the folder's own name/icon (children stay put); Update writes
+            // meta only and _updateItemAt preserves items.
+            newItemType = "submenu"
+            submenuFormIcon.currentIcon = r.iicon || ""
+            submenuFormLabel.text = r.ilabel || ""
+        } else if (r.itype === "action") {
             newItemType = "action"
             newItemCommand = r.icommand || ""
             newItemActionPluginId = r.ipluginId || ""
@@ -615,7 +746,7 @@ PluginSettings {
 
             StyledText {
                 width: parent.width
-                text: "1. Create a dropdown above, then click it to edit (click again to collapse)\n2. Add items: a Custom Action (shell command), a Plugin (toggle / open popout / IPC action), or an IPC Command\n3. Quick Add chips instantly add common panels — added ones stay highlighted until removed\n4. Click any item in the list to edit it; use the arrows to reorder or ✕ to remove\n5. The bar pill can show an icon, text, or both (set in the editor)\n6. Go to Bar Settings → Add Widget to place the dropdown on your bar\n\nClicking the dropdown on the bar opens/closes its menu."
+                text: "1. Create a dropdown above, then click it to edit (click again to collapse)\n2. Click “Add item…” (or a folder’s +) to open the editor dialog — pick a type or a Quick Add chip, then Add Item\n3. Group items with a Sub-menu (folder); drag the handle to reorder within a level, or “Move to” to shift an item into a folder\n4. Click any item to edit it; ✕ to remove\n5. The bar pill can show an icon, text, or both (set in the editor)\n6. Go to Bar Settings → Add Widget to place the dropdown on your bar\n\nClicking the dropdown on the bar opens/closes its menu."
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 wrapMode: Text.WordWrap
@@ -624,121 +755,268 @@ PluginSettings {
         }
     }
 
-    // Create new variant form
+    // Create dropdown — a compact card whose button opens the editor dialog.
     StyledRect {
         width: parent.width
-        height: createColumn.implicitHeight + Theme.spacingL * 2
+        height: createRow.implicitHeight + Theme.spacingL * 2
         radius: Theme.cornerRadius
         color: Theme.surfaceContainerHigh
 
-        Column {
-            id: createColumn
+        Row {
+            id: createRow
             anchors.fill: parent
             anchors.margins: Theme.spacingL
             spacing: Theme.spacingM
 
             StyledText {
-                text: "Add New Dropdown"
-                font.pixelSize: Theme.fontSizeMedium
-                font.weight: Font.Medium
-                color: Theme.surfaceText
-            }
-
-            Row {
-                width: parent.width
-                spacing: Theme.spacingM
-
-                Column {
-                    width: (parent.width - Theme.spacingM * 2) / 3
-                    spacing: Theme.spacingXS
-                    StyledText { text: "Name"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                    DankTextField {
-                        id: variantNameField
-                        width: parent.width
-                        placeholderText: "My Menu"
-                        onTextChanged: root.newVariantName = text
-                    }
-                    StyledText {
-                        width: parent.width
-                        text: "Shown in Add Widget picker"
-                        font.pixelSize: 10
-                        color: Theme.surfaceVariantText
-                        opacity: 0.7
-                        wrapMode: Text.WordWrap
-                    }
-                }
-
-                Column {
-                    width: (parent.width - Theme.spacingM * 2) / 3
-                    spacing: Theme.spacingXS
-                    StyledText { text: "Icon"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                    DropdownIconPicker {
-                        id: variantIconField
-                        width: parent.width
-                        currentIcon: "expand_circle_down"
-                        onIconSelected: (name) => {
-                            root.newVariantIcon = name
-                        }
-                    }
-                    StyledText {
-                        width: parent.width
-                        text: "Material icon name"
-                        font.pixelSize: 10
-                        color: Theme.surfaceVariantText
-                        opacity: 0.7
-                        wrapMode: Text.WordWrap
-                    }
-                }
-
-                Column {
-                    width: (parent.width - Theme.spacingM * 2) / 3
-                    spacing: Theme.spacingXS
-                    StyledText { text: "Label"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                    DankTextField {
-                        id: variantTextField
-                        width: parent.width
-                        placeholderText: "Menu"
-                        onTextChanged: root.newVariantText = text
-                    }
-                    StyledText {
-                        width: parent.width
-                        text: "Text shown on bar pill (leave blank for icon only)"
-                        font.pixelSize: 10
-                        color: Theme.surfaceVariantText
-                        opacity: 0.7
-                        wrapMode: Text.WordWrap
-                    }
-                }
+                text: "Add a new dropdown, set its bar pill, then add items to it."
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                width: parent.width - createBtn.width - Theme.spacingM
+                anchors.verticalCenter: parent.verticalCenter
+                wrapMode: Text.WordWrap
             }
 
             DankButton {
+                id: createBtn
                 text: "Create Dropdown"
                 iconName: "add"
-                onClicked: {
-                    if (!root.newVariantName) {
-                        ToastService.showError("Please enter a name for the dropdown")
-                        return
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: { root._resetCreateForm(); createDropdownPopup.open() }
+            }
+        }
+
+        // ── Create dropdown dialog ───────────────────────────────────────────
+        Popup {
+            id: createDropdownPopup
+            parent: Overlay.overlay
+            modal: true
+            dim: false
+            padding: 0
+            closePolicy: Popup.CloseOnEscape
+            x: 0
+            y: 0
+            width: Overlay.overlay?.width ?? 900
+            height: Overlay.overlay?.height ?? 800
+            onOpened: root._createOpenSnapshot = root._createFormSnapshot()
+
+            background: Rectangle { color: "transparent" }
+
+            contentItem: Item {
+                Rectangle {
+                    anchors.fill: parent
+                    color: Qt.rgba(0, 0, 0, 0.45)
+                    MouseArea { anchors.fill: parent; onClicked: root._tryCloseCreateDialog() }
+                }
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: Math.min(520, parent.width - 80)
+                    height: createForm.implicitHeight + Theme.spacingL * 2
+                    color: Theme.surface
+                    radius: Theme.cornerRadius
+
+                    MouseArea { anchors.fill: parent }   // absorb clicks on the card
+
+                    Column {
+                        id: createForm
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: Theme.spacingL
+                        spacing: Theme.spacingM
+
+                    StyledText {
+                        text: "New dropdown"
+                        font.pixelSize: Theme.fontSizeLarge
+                        font.weight: Font.Bold
+                        color: Theme.surfaceText
                     }
-                    const newId = createVariant(root.newVariantName, {
-                        icon: root.newVariantIcon || "expand_circle_down",
-                        text: root.newVariantText,
-                        items: []
-                    })
-                    if (newId) {
-                        // Reload the plugin so the bar settings widget picker
-                        // picks up the new variant immediately
-                        Qt.callLater(() => pluginService.reloadPlugin("dropdownMenu"))
-                        ToastService.showInfo("Dropdown created: " + root.newVariantName)
-                    } else {
-                        ToastService.showError("Failed to save — plugin service unavailable")
+
+                    Row {
+                        width: parent.width
+                        spacing: Theme.spacingM
+
+                        Column {
+                            width: 120
+                            spacing: Theme.spacingXS
+                            StyledText { text: "Icon"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                            DropdownIconPicker {
+                                id: variantIconField
+                                width: parent.width
+                                currentIcon: "expand_circle_down"
+                                onIconSelected: (name) => root.newVariantIcon = name
+                            }
+                        }
+
+                        Column {
+                            width: parent.width - 120 - Theme.spacingM
+                            spacing: Theme.spacingXS
+                            StyledText { text: "Name"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                            DankTextField {
+                                id: variantNameField
+                                width: parent.width
+                                placeholderText: "My Menu"
+                                onTextChanged: root.newVariantName = text
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: "Shown in the Add Widget picker"
+                                font.pixelSize: 10
+                                color: Theme.surfaceVariantText
+                                opacity: 0.7
+                                wrapMode: Text.WordWrap
+                            }
+                        }
                     }
-                    root.newVariantName = ""
-                    root.newVariantIcon = "expand_circle_down"
-                    root.newVariantText = ""
-                    variantNameField.text = ""
-                    variantIconField.currentIcon = "expand_circle_down"
-                    root.newVariantIcon = "expand_circle_down"
-                    variantTextField.text = ""
+
+                    Column {
+                        width: parent.width
+                        spacing: Theme.spacingXS
+                        StyledText { text: "Label"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                        DankTextField {
+                            id: variantTextField
+                            width: parent.width
+                            placeholderText: "Menu"
+                            onTextChanged: root.newVariantText = text
+                        }
+                        StyledText {
+                            width: parent.width
+                            text: "Text on the bar pill (leave blank for icon only)"
+                            font.pixelSize: 10
+                            color: Theme.surfaceVariantText
+                            opacity: 0.7
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    // Bar pill display
+                    Row {
+                        spacing: Theme.spacingS
+
+                        StyledText {
+                            text: "Bar pill shows:"
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        Repeater {
+                            model: [
+                                { value: "both", label: "Icon & Text" },
+                                { value: "icon", label: "Icon only"  },
+                                { value: "text", label: "Text only"  }
+                            ]
+                            delegate: DankButton {
+                                required property var modelData
+                                text: modelData.label
+                                buttonHeight: 32
+                                backgroundColor: root.newVariantPill === modelData.value ? Theme.primary : Theme.surfaceContainerHigh
+                                textColor: root.newVariantPill === modelData.value ? Theme.onPrimary : Theme.surfaceText
+                                onClicked: root.newVariantPill = modelData.value
+                            }
+                        }
+                    }
+
+                    // Actions
+                    Row {
+                        spacing: Theme.spacingS
+
+                        DankButton {
+                            text: "Create Dropdown"
+                            iconName: "add"
+                            onClicked: root._commitCreateForm()
+                        }
+
+                        DankButton {
+                            text: "Cancel"
+                            backgroundColor: Theme.surfaceContainerHigh
+                            textColor: Theme.surfaceText
+                            onClicked: createDropdownPopup.close()
+                        }
+                    }
+                }
+                }
+            }
+        }
+
+        // ── Unsaved-changes confirmation (shared by both dialogs) ────────────
+        Popup {
+            id: confirmPopup
+            parent: Overlay.overlay
+            modal: true
+            dim: true
+            padding: 0
+            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+            readonly property real _ow: Overlay.overlay?.width ?? 900
+            readonly property real _oh: Overlay.overlay?.height ?? 800
+            width: Math.min(420, _ow - 80)
+            height: confirmCol.implicitHeight + Theme.spacingL * 2
+            x: (_ow - width) / 2
+            y: (_oh - height) / 2
+
+            background: Rectangle { color: "transparent" }
+
+            contentItem: Rectangle {
+                color: Theme.surface
+                radius: Theme.cornerRadius
+
+                Column {
+                    id: confirmCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.spacingL
+                    spacing: Theme.spacingM
+
+                    StyledText {
+                        text: "Unsaved changes"
+                        font.pixelSize: Theme.fontSizeLarge
+                        font.weight: Font.Bold
+                        color: Theme.surfaceText
+                    }
+
+                    StyledText {
+                        width: parent.width
+                        text: "You have unsaved changes. Save them, discard them, or keep editing?"
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceVariantText
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Row {
+                        width: parent.width
+                        spacing: Theme.spacingS
+
+                        DankButton {
+                            text: "Save"
+                            iconName: "check"
+                            onClicked: {
+                                if (root._confirmTarget === "item") root._commitItemForm()
+                                else root._commitCreateForm()
+                                confirmPopup.close()
+                            }
+                        }
+
+                        DankButton {
+                            text: "Discard"
+                            backgroundColor: Theme.surfaceContainerHigh
+                            textColor: Theme.error
+                            onClicked: {
+                                if (root._confirmTarget === "item") addItemPopup.close()
+                                else createDropdownPopup.close()
+                                confirmPopup.close()
+                            }
+                        }
+
+                        DankButton {
+                            text: "Keep editing"
+                            backgroundColor: Theme.surfaceContainerHigh
+                            textColor: Theme.surfaceText
+                            onClicked: confirmPopup.close()
+                        }
+                    }
                 }
             }
         }
@@ -903,19 +1181,17 @@ PluginSettings {
             anchors.margins: Theme.spacingL
             spacing: Theme.spacingM
 
-            // Editable variant metadata (root level only)
+            // Editable variant metadata
             StyledText {
                 text: "Dropdown Settings"
                 font.pixelSize: Theme.fontSizeMedium
                 font.weight: Font.Medium
                 color: Theme.surfaceText
-                visible: root._atRoot
             }
 
             Row {
                 width: parent.width
                 spacing: Theme.spacingM
-                visible: root._atRoot
 
                 Column {
                     width: (parent.width - Theme.spacingM * 2) / 3
@@ -956,7 +1232,6 @@ PluginSettings {
             // Bar pill display mode
             Row {
                 spacing: Theme.spacingS
-                visible: root._atRoot
 
                 StyledText {
                     text: "Bar pill shows:"
@@ -985,79 +1260,36 @@ PluginSettings {
                 }
             }
 
-            // ── Drilled-in sub-menu header (breadcrumb + rename) ──────────────
-            Column {
-                width: parent.width
-                spacing: Theme.spacingS
-                visible: !root._atRoot
-
-                // Breadcrumb / back
-                Row {
-                    width: parent.width
-                    spacing: Theme.spacingS
-
-                    DankButton {
-                        text: "Back"
-                        iconName: "arrow_back"
-                        buttonHeight: 32
-                        backgroundColor: Theme.surfaceContainerHigh
-                        textColor: Theme.surfaceText
-                        onClicked: root._drillOut()
-                    }
-
-                    StyledText {
-                        text: (root.editingVariant?.name || "Menu") + "  ›  " + (root.editingSubmenuLabel || "Sub-menu")
-                        font.pixelSize: Theme.fontSizeMedium
-                        font.weight: Font.Medium
-                        color: Theme.surfaceText
-                        elide: Text.ElideRight
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width - Theme.spacingS - 100
-                    }
-                }
-
-                // Rename / re-icon this sub-menu
-                Row {
-                    width: parent.width
-                    spacing: Theme.spacingM
-
-                    Column {
-                        width: (parent.width - Theme.spacingM) / 2
-                        spacing: Theme.spacingXS
-                        StyledText { text: "Sub-menu icon"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                        DropdownIconPicker {
-                            id: submenuIconPicker
-                            width: parent.width
-                            currentIcon: "folder"
-                            onIconSelected: (name) => root._saveSubmenuMeta()
-                        }
-                    }
-
-                    Column {
-                        width: (parent.width - Theme.spacingM) / 2
-                        spacing: Theme.spacingXS
-                        StyledText { text: "Sub-menu name"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                        DankTextField {
-                            id: submenuNameField
-                            width: parent.width
-                            placeholderText: "Group name"
-                            onEditingFinished: root._saveSubmenuMeta()
-                        }
-                    }
-                }
-            }
-
             // Current items
             StyledText {
-                text: root._atRoot ? "Menu Items" : "Sub-menu Items"
+                text: "Menu Items"
                 font.pixelSize: Theme.fontSizeSmall
                 font.weight: Font.Medium
                 color: Theme.surfaceVariantText
             }
 
             StyledText {
-                visible: root._currentItems().length === 0
-                text: "No items yet. Add one below."
+                width: parent.width
+                text: "Folders show their items indented below. Use the chevron to fold a group, the reorder handle to move within a level, or “Move to” to shift an item into a folder."
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                wrapMode: Text.WordWrap
+            }
+
+            // Primary add action, at the top of the list.
+            DankButton {
+                text: "Add item…"
+                iconName: "add"
+                onClicked: {
+                    root.addTargetParent = -1
+                    root._resetItemForm()
+                    addItemPopup.open()
+                }
+            }
+
+            StyledText {
+                visible: localItemsModel.count === 0
+                text: "No items yet. Click “Add item…”."
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
             }
@@ -1070,47 +1302,54 @@ PluginSettings {
                 interactive: false
                 spacing: Theme.spacingS
 
-                property int draggedIndex: -1
-                property int dropIndex: -1
+                // Sibling-aware drag: a drag only reorders items within the level
+                // (top level or one folder) the dragged row belongs to. Cross-level
+                // moves are the per-row "Move to" control, not drag (v1).
+                property int draggedIndex: -1     // projection index being dragged
+                property int draggedParent: -2    // its level: -1 top, >=0 folder
+                property int draggedPos: -1       // its position within that level
+                property int dropPos: -1          // target position within the level
+                property int dropAboveProj: -1    // draw indicator above this row; -1 = append
+                property int dropLastSibProj: -1  // last sibling row (append line)
 
-                function updateDropIndex(draggedIdx, localY) {
-                    const totalItems = localItemsModel.count
-                    let foundDropIndex = totalItems
-
-                    for (let i = 0; i < totalItems; i++) {
-                        const delegate = itemsListView.itemAtIndex(i)
-                        if (!delegate) continue
-
-                        const midpoint = delegate.y + delegate.height / 2
-                        if (localY < midpoint) {
-                            foundDropIndex = i
-                            break
+                function updateDropIndex(draggedProjIdx, localY) {
+                    const dr = localItemsModel.get(draggedProjIdx)
+                    if (!dr) return
+                    const parent = dr.rParent
+                    let aboveProj = -1
+                    let targetPos = 0
+                    let lastSibProj = -1
+                    let sibCount = 0
+                    for (let i = 0; i < localItemsModel.count; i++) {
+                        const r = localItemsModel.get(i)
+                        if (r.rParent !== parent) continue   // only siblings of the dragged row
+                        lastSibProj = i
+                        sibCount++
+                        if (aboveProj === -1) {
+                            const del = itemsListView.itemAtIndex(i)
+                            if (del && localY < del.y + del.height / 2) {
+                                aboveProj = i
+                                targetPos = r.rPos
+                            }
                         }
                     }
-
-                    dropIndex = Math.max(0, Math.min(totalItems, foundDropIndex))
-                    draggedIndex = draggedIdx
+                    if (aboveProj === -1) targetPos = sibCount   // past the last sibling
+                    draggedIndex = draggedProjIdx
+                    draggedParent = parent
+                    draggedPos = dr.rPos
+                    dropPos = targetPos
+                    dropAboveProj = aboveProj
+                    dropLastSibProj = lastSibProj
                 }
 
                 function finishDrag() {
-                    if (draggedIndex < 0) {
-                        dropIndex = -1
-                        return
-                    }
-
-                    const fromIndex = draggedIndex
-                    let toIndex = dropIndex
-
-                    draggedIndex = -1
-                    dropIndex = -1
-
-                    if (toIndex < 0 || toIndex > localItemsModel.count || toIndex === fromIndex || toIndex === fromIndex + 1)
-                        return
-
-                    if (toIndex > fromIndex) toIndex -= 1
-
-                    localItemsModel.move(fromIndex, toIndex, 1)
-                    root._saveItems(root._currentItems())
+                    const parent = draggedParent
+                    const from = draggedPos
+                    const to = dropPos
+                    draggedIndex = -1; draggedParent = -2; draggedPos = -1
+                    dropPos = -1; dropAboveProj = -1; dropLastSibProj = -1
+                    if (from < 0) return
+                    root._reorderWithinLevel(parent, from, to)
                 }
 
                 move: Transition {
@@ -1120,17 +1359,7 @@ PluginSettings {
                     NumberAnimation { properties: "y"; duration: 200; easing.type: Easing.InOutQuad }
                 }
 
-                // Drop indicator
-                footer: Component {
-                    Rectangle {
-                        width: itemsListView.width
-                        height: 2
-                        color: Theme.primary
-                        visible: itemsListView.draggedIndex >= 0 && itemsListView.dropIndex === localItemsModel.count
-                    }
-                }
-
-                delegate: StyledRect {
+                delegate: Item {
                     id: itemDelegate
                     required property string itype
                     required property string iicon
@@ -1140,11 +1369,31 @@ PluginSettings {
                     required property string iwidgetId
                     required property string idisplay
                     required property string isubJson
+                    required property int rDepth
+                    required property int rParent
+                    required property int rPos
+                    required property bool rGroupBg
+                    required property bool rGroupTop
+                    required property bool rGroupBottom
                     required property int index
 
                     readonly property string _idRef: itype === "popout" ? iwidgetId : ipluginId
-                    readonly property int _subCount: itype === "submenu"
-                        ? JSON.parse(isubJson || "[]").length : 0
+                    readonly property int _subCount: itype === "submenu" ? JSON.parse(isubJson || "[]").length : 0
+                    readonly property bool _expanded: itype === "submenu" && !!root.editorExpanded[rPos]
+
+                    // "Move to" destinations for this item (folders + top level), minus current.
+                    readonly property var _moveDests: {
+                        if (itype === "submenu") return []
+                        const out = []
+                        if (rParent >= 0) out.push({ label: "Top level", parent: -1 })
+                        const fs = root._folders
+                        for (let i = 0; i < fs.length; i++) {
+                            if (fs[i].index === rParent) continue
+                            out.push({ label: fs[i].label, parent: fs[i].index })
+                        }
+                        return out
+                    }
+                    readonly property bool _canMove: itype !== "submenu" && _moveDests.length > 0
 
                     readonly property string resolvedIcon: iicon !== "" ? iicon
                         : (itype === "submenu" ? "folder"
@@ -1158,38 +1407,78 @@ PluginSettings {
                             : "(no label)")
 
                     width: itemsListView.width
-                    height: itemRow.implicitHeight + Theme.spacingS * 2
-                    radius: Theme.cornerRadius
-                    color: root.editingItemIndex === index
-                        ? Theme.primaryContainer
-                        : (editItemArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer)
+                    height: card.height
 
-                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-
+                    // Shaded band behind an expanded folder + its items. Each member
+                    // row draws its slice; non-top members stretch up by the list
+                    // spacing to bridge the gap, so the band reads as one continuous
+                    // rounded container. Painted before the card, so it sits behind.
                     Rectangle {
-                        width: parent.width
-                        height: 2
-                        color: Theme.primary
+                        visible: itemDelegate.rGroupBg
+                        color: Theme.withAlpha(Theme.secondaryContainer, 0.4)
+                        anchors.left: parent.left
+                        anchors.right: parent.right
                         anchors.top: parent.top
-                        anchors.topMargin: -Theme.spacingS / 2
-                        visible: itemsListView.draggedIndex >= 0 && itemsListView.dropIndex === index
+                        anchors.topMargin: itemDelegate.rGroupTop ? -Theme.spacingXS : -itemsListView.spacing
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: itemDelegate.rGroupBottom ? -Theme.spacingXS : 0
+                        topLeftRadius: itemDelegate.rGroupTop ? Theme.cornerRadius : 0
+                        topRightRadius: itemDelegate.rGroupTop ? Theme.cornerRadius : 0
+                        bottomLeftRadius: itemDelegate.rGroupBottom ? Theme.cornerRadius : 0
+                        bottomRightRadius: itemDelegate.rGroupBottom ? Theme.cornerRadius : 0
+                    }
+
+                    // Visible card, inset from the left for nested rows so the whole
+                    // container sits indented under its folder. (ListView owns the
+                    // delegate's x, so we inset an inner card, not the root.)
+                    StyledRect {
+                        id: card
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        // Uniform horizontal padding on every card (plus the nesting
+                        // indent on the left) so rows align and the shaded group band
+                        // shows as a frame on both sides.
+                        anchors.leftMargin: Theme.spacingS + itemDelegate.rDepth * Theme.spacingL
+                        anchors.rightMargin: Theme.spacingS
+                        height: itemRow.implicitHeight + Theme.spacingS * 2
+                        radius: Theme.cornerRadius
+                        color: (root.editingParent === itemDelegate.rParent && root.editingPos === itemDelegate.rPos)
+                            ? Theme.primaryContainer
+                            : (itemDelegate.itype === "submenu" ? Theme.surfaceContainerHigh
+                            : (editItemArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer))
+
+                        Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+                    // Reorder drop indicators: before this row, or after the last sibling.
+                    Rectangle {
+                        width: parent.width; height: 2; color: Theme.primary
+                        anchors.top: parent.top; anchors.topMargin: -Theme.spacingS / 2
+                        visible: itemsListView.draggedIndex >= 0 && itemsListView.dropAboveProj === index
+                    }
+                    Rectangle {
+                        width: parent.width; height: 2; color: Theme.primary
+                        anchors.bottom: parent.bottom; anchors.bottomMargin: -Theme.spacingS / 2
+                        visible: itemsListView.draggedIndex >= 0 && itemsListView.dropAboveProj === -1
+                                 && itemsListView.dropLastSibProj === index
                     }
 
                     opacity: itemsListView.draggedIndex === index ? 0.5 : 1.0
 
-                    // Click the row (outside the reorder/remove buttons) to edit it
+                    // Click the row body (not chevron/handle/move/remove) to edit it.
                     MouseArea {
                         id: editItemArea
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root._editItem(index)
+                        // Edit shares the same form, which now lives in the dialog.
+                        onClicked: { root._editItem(index); addItemPopup.open() }
                     }
 
                     Row {
                         id: itemRow
                         anchors.left: parent.left
-                        anchors.right: removeItemBtn.left
+                        anchors.right: itemDelegate.itype === "submenu" ? addInsideBtn.left
+                                     : (itemDelegate._canMove ? moveDropdown.left : removeItemBtn.left)
                         anchors.top: parent.top
                         anchors.bottom: parent.bottom
                         anchors.margins: Theme.spacingS
@@ -1201,41 +1490,35 @@ PluginSettings {
                             color: reorderArea.pressed ? Theme.surfaceContainerHighest : "transparent"
                             anchors.verticalCenter: parent.verticalCenter
 
-                            DankIcon {
-                                anchors.centerIn: parent
-                                name: "reorder"
-                                size: 18
-                                color: Theme.surfaceVariantText
-                            }
+                            DankIcon { anchors.centerIn: parent; name: "reorder"; size: 18; color: Theme.surfaceVariantText }
 
                             MouseArea {
                                 id: reorderArea
                                 anchors.fill: parent
                                 cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
                                 preventStealing: true
+                                onPressed: (mouse) => { mouse.accepted = true; const p = mapToItem(itemsListView, mouse.x, mouse.y); itemsListView.updateDropIndex(index, p.y) }
+                                onPositionChanged: (mouse) => { if (!pressed) return; mouse.accepted = true; const p = mapToItem(itemsListView, mouse.x, mouse.y); itemsListView.updateDropIndex(index, p.y) }
+                                onReleased: (mouse) => { mouse.accepted = true; itemsListView.finishDrag() }
+                                onCanceled: { itemsListView.draggedIndex = -1; itemsListView.draggedParent = -2; itemsListView.dropAboveProj = -1; itemsListView.dropLastSibProj = -1 }
+                            }
+                        }
 
-                                onPressed: (mouse) => {
-                                    mouse.accepted = true
-                                    const point = mapToItem(itemsListView, mouse.x, mouse.y)
-                                    itemsListView.updateDropIndex(index, point.y)
-                                }
-
-                                onPositionChanged: (mouse) => {
-                                    if (!pressed) return
-                                    mouse.accepted = true
-                                    const point = mapToItem(itemsListView, mouse.x, mouse.y)
-                                    itemsListView.updateDropIndex(index, point.y)
-                                }
-
-                                onReleased: (mouse) => {
-                                    mouse.accepted = true
-                                    itemsListView.finishDrag()
-                                }
-
-                                onCanceled: {
-                                    itemsListView.draggedIndex = -1
-                                    itemsListView.dropIndex = -1
-                                }
+                        // Expand/collapse chevron (folders only); reserved slot keeps icons aligned.
+                        Item {
+                            width: 18; height: 32
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: itemDelegate.itype === "submenu"
+                            DankIcon {
+                                anchors.centerIn: parent
+                                name: itemDelegate._expanded ? "expand_more" : "chevron_right"
+                                size: 18
+                                color: Theme.surfaceText
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root._toggleEditorExpand(itemDelegate.rPos)
                             }
                         }
 
@@ -1249,11 +1532,12 @@ PluginSettings {
                         Column {
                             anchors.verticalCenter: parent.verticalCenter
                             spacing: 2
-                            width: parent.width - 24 - (Theme.iconSize - 4) - (parent.spacing * 2)
+                            width: parent.width - 24 - (itemDelegate.itype === "submenu" ? 18 + parent.spacing : 0) - (Theme.iconSize - 4) - (parent.spacing * 2)
 
                             StyledText {
                                 text: resolvedLabel
                                 font.pixelSize: Theme.fontSizeMedium
+                                font.weight: itemDelegate.itype === "submenu" ? Font.Medium : Font.Normal
                                 color: Theme.surfaceText
                                 elide: Text.ElideRight
                                 width: parent.width
@@ -1266,50 +1550,68 @@ PluginSettings {
 
                                 StyledRect {
                                     id: typeBadgeRect
-                                    height: 18
-                                    width: typeBadge.implicitWidth + 10
-                                    radius: 9
+                                    height: 18; width: typeBadge.implicitWidth + 10; radius: 9
                                     color: itype === "action" ? Theme.secondaryContainer : Theme.tertiaryContainer
-
-                                    StyledText {
-                                        id: typeBadge
-                                        anchors.centerIn: parent
-                                        text: itype
-                                        font.pixelSize: 10
-                                        color: Theme.surfaceText
-                                        font.weight: Font.Bold
-                                    }
+                                    StyledText { id: typeBadge; anchors.centerIn: parent; text: itype; font.pixelSize: 10; color: Theme.surfaceText; font.weight: Font.Bold }
                                 }
 
                                 StyledRect {
                                     id: displayBadgeRect
-                                    height: 18
-                                    width: displayBadge.implicitWidth + 10
-                                    radius: 9
+                                    height: 18; width: displayBadge.implicitWidth + 10; radius: 9
                                     color: Theme.surfaceContainerHighest
-
-                                    StyledText {
-                                        id: displayBadge
-                                        anchors.centerIn: parent
-                                        text: idisplay
-                                        font.pixelSize: 10
-                                        color: Theme.surfaceText
-                                        font.weight: Font.Medium
-                                    }
+                                    StyledText { id: displayBadge; anchors.centerIn: parent; text: idisplay; font.pixelSize: 10; color: Theme.surfaceText; font.weight: Font.Medium }
                                 }
 
                                 StyledText {
                                     width: subtitleRow.width - typeBadgeRect.width - displayBadgeRect.width - Theme.spacingXS * 2
                                     text: itype === "submenu"
-                                        ? (_subCount + (_subCount === 1 ? " item" : " items") + " · click to open")
-                                        : (itype === "action" ? icommand
-                                        : (itype === "popout" ? iwidgetId : ipluginId))
+                                        ? (_subCount + (_subCount === 1 ? " item" : " items"))
+                                        : (itype === "action" ? icommand : (itype === "popout" ? iwidgetId : ipluginId))
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.surfaceVariantText
                                     elide: Text.ElideRight
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
                             }
+                        }
+                    }
+
+                    // Per-row "Move to" — non-folder items with at least one destination.
+                    DankDropdown {
+                        id: moveDropdown
+                        visible: itemDelegate._canMove
+                        anchors.right: removeItemBtn.left
+                        anchors.rightMargin: Theme.spacingXS
+                        anchors.verticalCenter: parent.verticalCenter
+                        compactMode: true
+                        dropdownWidth: 148
+                        text: ""
+                        emptyText: "Move to…"
+                        options: itemDelegate._moveDests.map(d => d.label)
+                        onValueChanged: (value) => {
+                            const d = itemDelegate._moveDests.find(x => x.label === value)
+                            if (d) root._moveItem(itemDelegate.rParent, itemDelegate.rPos, d.parent)
+                        }
+                    }
+
+                    // Add-inside (folders only): next adds land in this folder.
+                    DankActionButton {
+                        id: addInsideBtn
+                        visible: itemDelegate.itype === "submenu"
+                        iconName: "add"
+                        buttonSize: 32
+                        anchors.right: removeItemBtn.left
+                        anchors.rightMargin: Theme.spacingXS
+                        anchors.verticalCenter: parent.verticalCenter
+                        tooltipText: "Add item inside this folder"
+                        onClicked: {
+                            root.addTargetParent = itemDelegate.rPos
+                            const m = Object.assign({}, root.editorExpanded)
+                            m[itemDelegate.rPos] = true
+                            root.editorExpanded = m
+                            root._syncItemsModel()
+                            root._resetItemForm()
+                            addItemPopup.open()
                         }
                     }
 
@@ -1328,124 +1630,176 @@ PluginSettings {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                const items = root._currentItems()
-                                items.splice(index, 1)
-                                root._saveItems(items)
-                            }
+                            onClicked: root._removeItemAt(itemDelegate.rParent, itemDelegate.rPos)
                         }
+                    }
                     }
                 }
             }
 
-            // Divider
-            Rectangle {
-                width: parent.width; height: 1
-                color: Theme.outlineVariant; opacity: 0.5
-            }
+        }
+        // ── Add / Edit item dialog ───────────────────────────────────────────
+        // The shared form lives here (modal overlay, like DropdownIconPicker) so
+        // adding/editing happens in a focused dialog instead of a form far below
+        // the list. Opened by the folder "+", the "Add item…" button, and (row
+        // click) editing.
+        Popup {
+            id: addItemPopup
+            parent: Overlay.overlay
+            modal: true
+            dim: false
+            padding: 0
+            closePolicy: Popup.CloseOnEscape   // Esc hard-closes; outside-click is handled below
+            x: 0
+            y: 0
+            width: Overlay.overlay?.width ?? 900
+            height: Overlay.overlay?.height ?? 800
+            onOpened: root._itemOpenSnapshot = root._itemFormSnapshot()
 
-            // Quick Add — built-in panel shortcuts
-            StyledText {
-                text: "Quick Add"
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.Medium
-                color: Theme.surfaceVariantText
-            }
+            background: Rectangle { color: "transparent" }
 
-            StyledText {
-                width: parent.width
-                text: "Click a chip to pre-fill the form below — customize then click Add Item:"
-                font.pixelSize: Theme.fontSizeSmall
-                color: Theme.surfaceVariantText
-                wrapMode: Text.WordWrap
-            }
+            contentItem: Item {
+                // Scrim over the whole overlay: a click outside the card closes the
+                // dialog if unchanged, or prompts (Save/Discard/Cancel) if dirty.
+                Rectangle {
+                    anchors.fill: parent
+                    color: Qt.rgba(0, 0, 0, 0.45)
+                    MouseArea { anchors.fill: parent; onClicked: root._tryCloseItemDialog() }
+                }
 
-            Flow {
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: Math.min(600, parent.width - 80)
+                    height: Math.min(640, parent.height - 80)
+                    color: Theme.surface
+                    radius: Theme.cornerRadius
+
+                    MouseArea { anchors.fill: parent }   // absorb clicks on the card so they don't hit the scrim
+
+                    Flickable {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingL
+                        contentHeight: dialogForm.implicitHeight
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+
+                        Column {
+                            id: dialogForm
+                            width: parent.width
+                            spacing: Theme.spacingM
+
+            Row {
                 width: parent.width
                 spacing: Theme.spacingS
 
-                Repeater {
-                    model: root.quickAddItems
+                StyledText {
+                    text: root._isEditing ? "Edit Item" : "Add Item"
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: root._isEditing ? Theme.primary : Theme.surfaceVariantText
+                    anchors.verticalCenter: parent.verticalCenter
+                }
 
-                    delegate: Rectangle {
-                        required property var modelData
+                // "Adding into <folder>" chip — click ✕ to add to top level instead.
+                Rectangle {
+                    visible: !root._isEditing && root.addTargetParent >= 0
+                    height: 22
+                    width: addToRow.implicitWidth + Theme.spacingS * 2
+                    radius: 11
+                    color: Theme.primaryContainer
+                    anchors.verticalCenter: parent.verticalCenter
 
-                        readonly property bool alreadyAdded: {
-                            // localItemsModel.count makes this binding reactive to list changes
-                            for (let i = 0; i < localItemsModel.count; i++) {
-                                if (localItemsModel.get(i).ipluginId === modelData.pluginId)
-                                    return true
-                            }
-                            return false
+                    Row {
+                        id: addToRow
+                        anchors.centerIn: parent
+                        spacing: Theme.spacingXS
+                        DankIcon { name: "folder"; size: 12; color: Theme.onPrimaryContainer; anchors.verticalCenter: parent.verticalCenter }
+                        StyledText {
+                            text: "into " + (root._folders.find(f => f.index === root.addTargetParent)?.label || "folder")
+                            font.pixelSize: 10
+                            color: Theme.onPrimaryContainer
+                            anchors.verticalCenter: parent.verticalCenter
                         }
-
-                        height: 32
-                        width: chipRow.implicitWidth + Theme.spacingM * 2
-                        radius: height / 2
-                        color: alreadyAdded
-                            ? Theme.withAlpha(Theme.primary, 0.15)
-                            : (chipArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer)
-                        border.color: alreadyAdded ? Theme.primary : "transparent"
-                        border.width: alreadyAdded ? 1 : 0
-
-                        Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-
-                        Row {
-                            id: chipRow
-                            anchors.centerIn: parent
-                            spacing: Theme.spacingXS
-
-                            DankIcon {
-                                name: modelData.icon
-                                size: 14
-                                color: alreadyAdded ? Theme.primary : Theme.surfaceText
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-
-                            StyledText {
-                                text: modelData.label
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: alreadyAdded ? Theme.primary : Theme.surfaceText
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                        }
-
-                        MouseArea {
-                            id: chipArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: alreadyAdded ? Qt.ArrowCursor : Qt.PointingHandCursor
-                            enabled: !alreadyAdded
-                            onClicked: {
-                                // Add immediately with the chip's icon + default toggle action.
-                                // Stays highlighted (alreadyAdded) until removed from the list.
-                                const items = root._currentItems().slice()
-                                items.push({
-                                    type: "plugin",
-                                    icon: modelData.icon,
-                                    label: "",
-                                    pluginId: modelData.pluginId,
-                                    display: "both"
-                                })
-                                root._saveItems(items)
-                                ToastService.showInfo(modelData.label + " added")
-                            }
+                        DankIcon {
+                            name: "close"; size: 12; color: Theme.onPrimaryContainer
+                            anchors.verticalCenter: parent.verticalCenter
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.addTargetParent = -1 }
                         }
                     }
                 }
             }
 
-            // Divider before manual form
-            Rectangle {
-                width: parent.width; height: 1
-                color: Theme.outlineVariant; opacity: 0.3
-            }
+            // Quick Add — pre-fills the form with a common panel (add mode only);
+            // the user reviews/tweaks, then clicks Add Item to actually save.
+            Column {
+                width: parent.width
+                spacing: Theme.spacingXS
+                visible: !root._isEditing
 
-            StyledText {
-                text: root.editingItemIndex >= 0 ? "Edit Item" : "Add Item"
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.Medium
-                color: root.editingItemIndex >= 0 ? Theme.primary : Theme.surfaceVariantText
+                StyledText {
+                    text: "Quick add a common panel"
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                }
+
+                Flow {
+                    width: parent.width
+                    spacing: Theme.spacingS
+
+                    Repeater {
+                        model: root.quickAddItems
+
+                        delegate: Rectangle {
+                            required property var modelData
+
+                            // Highlight the chip currently pre-filled into the form.
+                            readonly property bool selected: root.newItemType === "plugin"
+                                && root.newItemPluginId === modelData.pluginId
+
+                            height: 32
+                            width: chipRow.implicitWidth + Theme.spacingM * 2
+                            radius: height / 2
+                            color: selected
+                                ? Theme.withAlpha(Theme.primary, 0.15)
+                                : (chipArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer)
+                            border.color: selected ? Theme.primary : "transparent"
+                            border.width: selected ? 1 : 0
+
+                            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+                            Row {
+                                id: chipRow
+                                anchors.centerIn: parent
+                                spacing: Theme.spacingXS
+                                DankIcon { name: modelData.icon; size: 14; color: selected ? Theme.primary : Theme.surfaceText; anchors.verticalCenter: parent.verticalCenter }
+                                StyledText { text: modelData.label; font.pixelSize: Theme.fontSizeSmall; color: selected ? Theme.primary : Theme.surfaceText; anchors.verticalCenter: parent.verticalCenter }
+                            }
+
+                            MouseArea {
+                                id: chipArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    // Pre-fill the Plugin form with a toggle default —
+                                    // does NOT save until the user clicks Add Item.
+                                    root.newItemType = "plugin"
+                                    root.newItemPluginId = modelData.pluginId
+                                    root.newItemIcon = modelData.icon
+                                    root.newItemLabel = ""
+                                    pluginIconField.currentIcon = modelData.icon
+                                    pluginLabelField.text = ""
+                                    pluginPicker.currentValue = root._displayNameFor(modelData.pluginId)
+                                    root._detectPluginCommands(modelData.pluginId)
+                                    root.newPluginActionKind = "toggle"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: Theme.outlineVariant; opacity: 0.3 }
             }
 
             // Type selector — use backgroundColor to show active state, no flat prop
@@ -1480,12 +1834,13 @@ PluginSettings {
                     onClicked: root.newItemType = "ipc"
                 }
 
-                // Sub-menus only nest one level, so this is hidden once drilled in.
+                // Sub-menus only nest one level, so a folder can only be added at
+                // the top level (not when the add target is a folder).
                 DankButton {
                     text: "Sub-menu"
                     iconName: "folder"
                     buttonHeight: 32
-                    visible: root._atRoot
+                    visible: root.addTargetParent < 0
                     backgroundColor: root.newItemType === "submenu" ? Theme.primary : Theme.surfaceContainerHigh
                     textColor: root.newItemType === "submenu" ? Theme.onPrimary : Theme.surfaceText
                     onClicked: root.newItemType = "submenu"
@@ -1914,109 +2269,22 @@ PluginSettings {
                 spacing: Theme.spacingS
 
                 DankButton {
-                    text: root.editingItemIndex >= 0 ? "Update Item" : "Add Item"
-                    iconName: root.editingItemIndex >= 0 ? "check" : "add"
-                    onClicked: {
-                        let newItem = null
-                        if (root.newItemType === "submenu") {
-                            if (!root.newItemLabel) {
-                                ToastService.showError("Please enter a name for the sub-menu")
-                                return
-                            }
-                            newItem = {
-                                type: "submenu",
-                                icon: root.newItemIcon,
-                                label: root.newItemLabel,
-                                display: root.newItemDisplay,
-                                items: []   // children added by drilling in
-                            }
-                        } else if (root.newItemType === "action") {
-                            if (!root.newItemCommand) {
-                                ToastService.showError("Please enter a shell command")
-                                return
-                            }
-                            if (!root.newItemLabel) {
-                                ToastService.showError("Please enter a label")
-                                return
-                            }
-                            newItem = {
-                                type: "action",
-                                icon: root.newItemIcon,
-                                label: root.newItemLabel,
-                                command: root.newItemCommand,
-                                display: root.newItemDisplay
-                            }
-                            // Preserve the owning plugin of a plugin-sourced IPC action
-                            // through an edit so the widget keeps hosting it.
-                            if (root.newItemActionPluginId)
-                                newItem.pluginId = root.newItemActionPluginId
-                        } else if (root.newItemType === "ipc") {
-                            if (!root.newItemIpcTarget || !root.newItemIpcFunction) {
-                                ToastService.showError("Please select an IPC target and function")
-                                return
-                            }
-                            newItem = {
-                                type: "action",
-                                icon: root.newItemIcon,
-                                label: root.newItemLabel || (root.newItemIpcTarget + ": " + root.newItemIpcFunction),
-                                command: root.ipcCommandPreview,
-                                display: root.newItemDisplay
-                            }
-                        } else {
-                            if (!root.newItemPluginId) {
-                                ToastService.showError("Please select a plugin")
-                                return
-                            }
-                            const pName = (root.availablePluginList.find(p => p.id === root.newItemPluginId) || {}).name || root.newItemPluginId
-                            if (root.newPluginActionKind === "ipc" && root.newPluginCmdFn) {
-                                newItem = {
-                                    type: "action",
-                                    icon: root.newItemIcon,
-                                    label: root.newItemLabel || (pName + ": " + root.newPluginCmdFn),
-                                    command: "dms ipc " + root.newPluginCmdTarget + " " + root.newPluginCmdFn,
-                                    pluginId: root.newItemPluginId,
-                                    display: root.newItemDisplay
-                                }
-                            } else if (root.newPluginActionKind === "popout") {
-                                newItem = {
-                                    type: "popout",
-                                    icon: root.newItemIcon,
-                                    label: root.newItemLabel,
-                                    widgetId: root.newItemPluginId,
-                                    display: root.newItemDisplay
-                                }
-                            } else {
-                                newItem = {
-                                    type: "plugin",
-                                    icon: root.newItemIcon,
-                                    label: root.newItemLabel,
-                                    pluginId: root.newItemPluginId,
-                                    display: root.newItemDisplay
-                                }
-                            }
-                        }
-
-                        const items = root._currentItems().slice()
-                        const wasEditing = root.editingItemIndex >= 0 && root.editingItemIndex < items.length
-                        if (wasEditing)
-                            items[root.editingItemIndex] = newItem
-                        else
-                            items.push(newItem)
-                        root._saveItems(items)
-                        root._resetItemForm()
-                        ToastService.showInfo(wasEditing ? "Item updated" : "Item added")
-                    }
+                    text: root._isEditing ? "Update Item" : "Add Item"
+                    iconName: root._isEditing ? "check" : "add"
+                    onClicked: root._commitItemForm()
                 }
 
                 DankButton {
-                    visible: root.editingItemIndex >= 0
                     text: "Cancel"
                     backgroundColor: Theme.surfaceContainerHigh
                     textColor: Theme.surfaceText
-                    onClicked: root._resetItemForm()
+                    onClicked: { root._resetItemForm(); addItemPopup.close() }
+                }
+            }
+                        }
+                    }
                 }
             }
         }
     }
-
 }

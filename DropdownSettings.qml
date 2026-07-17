@@ -21,6 +21,9 @@ PluginSettings {
     property var editorExpanded: ({})
     // Where the next added item lands: -1 = top level, >=0 = that root folder.
     property int addTargetParent: -1
+    // Position within the target level for the next add: -1 = append, >=0 =
+    // insert before that index (set by the hover-to-insert "+" between rows).
+    property int addTargetPos: -1
     // Folders (root-level sub-menus), for the per-row "Move to" chooser.
     readonly property var _folders: {
         const out = []
@@ -342,6 +345,46 @@ PluginSettings {
         _commitTree(tree)
     }
 
+    // Inserting a root item shifts folder root indices >= pos up by one.
+    function _expandedAfterRootInsert(insertedAt) {
+        const out = {}
+        for (const k in editorExpanded) {
+            if (!editorExpanded[k]) continue
+            const i = parseInt(k)
+            out[i < insertedAt ? i : i + 1] = true
+        }
+        return out
+    }
+
+    // Insert an item at a specific position within a level (hover-to-insert).
+    function _insertItemAt(parent, pos, item) {
+        const tree = _cloneTree()
+        const lvl = _levelOf(tree, parent)
+        if (pos < 0 || pos > lvl.length) lvl.push(item)
+        else lvl.splice(pos, 0, item)
+        if (parent < 0) editorExpanded = _expandedAfterRootInsert(pos)
+        else { const m = Object.assign({}, editorExpanded); m[parent] = true; editorExpanded = m }
+        _commitTree(tree)
+    }
+
+    // Open the add dialog to APPEND to a level (top-level button / folder "+").
+    function _openAddDialog(parent) {
+        _resetItemForm()
+        addTargetParent = parent
+        addTargetPos = -1
+        if (parent >= 0) { const m = Object.assign({}, editorExpanded); m[parent] = true; editorExpanded = m; _syncItemsModel() }
+        addItemPopup.open()
+    }
+
+    // Open the add dialog to INSERT before (parent, pos) — the between-rows "+".
+    function _openInsertDialog(parent, pos) {
+        _resetItemForm()
+        addTargetParent = parent
+        addTargetPos = pos
+        if (parent >= 0) { const m = Object.assign({}, editorExpanded); m[parent] = true; editorExpanded = m; _syncItemsModel() }
+        addItemPopup.open()
+    }
+
     function _updateItemAt(parent, pos, item) {
         const tree = _cloneTree()
         const lvl = _levelOf(tree, parent)
@@ -472,6 +515,7 @@ PluginSettings {
         }
         const wasEditing = _isEditing
         if (wasEditing) _updateItemAt(editingParent, editingPos, newItem)
+        else if (addTargetPos >= 0) _insertItemAt(addTargetParent, addTargetPos, newItem)
         else _addItemAt(addTargetParent, newItem)
         _resetItemForm()
         addItemPopup.close()
@@ -496,6 +540,7 @@ PluginSettings {
         editingPillDisplay = variant.pillDisplay || "both"
         editorExpanded = ({})       // start collapsed
         addTargetParent = -1        // add to top level by default
+        addTargetPos = -1
         _syncItemsModel()
         // Populate the meta-edit fields
         editNameField.text = variant.name || ""
@@ -1280,11 +1325,7 @@ PluginSettings {
             DankButton {
                 text: "Add item…"
                 iconName: "add"
-                onClicked: {
-                    root.addTargetParent = -1
-                    root._resetItemForm()
-                    addItemPopup.open()
-                }
+                onClicked: root._openAddDialog(-1)
             }
 
             StyledText {
@@ -1604,15 +1645,7 @@ PluginSettings {
                         anchors.rightMargin: Theme.spacingXS
                         anchors.verticalCenter: parent.verticalCenter
                         tooltipText: "Add item inside this folder"
-                        onClicked: {
-                            root.addTargetParent = itemDelegate.rPos
-                            const m = Object.assign({}, root.editorExpanded)
-                            m[itemDelegate.rPos] = true
-                            root.editorExpanded = m
-                            root._syncItemsModel()
-                            root._resetItemForm()
-                            addItemPopup.open()
-                        }
+                        onClicked: root._openAddDialog(itemDelegate.rPos)
                     }
 
                     Rectangle {
@@ -1633,6 +1666,44 @@ PluginSettings {
                             onClicked: root._removeItemAt(itemDelegate.rParent, itemDelegate.rPos)
                         }
                     }
+                    }
+
+                    // Hover the gap above a row to reveal a "+" that inserts a new
+                    // item *before* it, at this row's level/indent (Word-table style).
+                    Item {
+                        z: 10
+                        anchors.left: card.left
+                        anchors.right: card.right
+                        anchors.top: parent.top
+                        anchors.topMargin: -itemsListView.spacing
+                        height: itemsListView.spacing + 6
+                        visible: itemsListView.draggedIndex < 0
+
+                        Rectangle {
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            height: 2
+                            radius: 1
+                            color: Theme.primary
+                            visible: insertArea.containsMouse
+                        }
+
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 20; height: 20; radius: 10
+                            color: Theme.primary
+                            visible: insertArea.containsMouse
+                            DankIcon { anchors.centerIn: parent; name: "add"; size: 14; color: Theme.onPrimary }
+                        }
+
+                        MouseArea {
+                            id: insertArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root._openInsertDialog(itemDelegate.rParent, itemDelegate.rPos)
+                        }
                     }
                 }
             }
